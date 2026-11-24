@@ -2,41 +2,60 @@
 
 #include "ICollection.hpp"
 #include "MutableSequenceArray.hpp"
+#include "AvlIteration.hpp"
 #include <functional> 
 #include <memory> 
 #include <iomanip>
+#include <array>
+
+// namespace TraversalOrder {
+//     using Step = std::function<void()>;
+//     using Policy = std::function<void(Step, Step, Step)>;
+
+//     inline Policy LKP = [](Step root, Step left, Step right) {
+//         left(); root(); right();
+//     };
+
+//     inline Policy KLP = [](Step root, Step left, Step right) {
+//         root(); left(); right();
+//     };
+
+//     inline Policy KPL = [](Step root, Step left, Step right) {
+//         root(); right(); left();
+//     };
+
+//     inline Policy LPK = [](Step root, Step left, Step right) {
+//         left(); right(); root();
+//     };
+
+//     inline Policy PLK = [](Step root, Step left, Step right) {
+//         right(); left(); root();
+//     };
+
+//     inline Policy PKL = [](Step root, Step left, Step right) {
+//         right(); root(); left();
+//     };
+// }
 
 namespace TraversalOrder {
-    using Step = std::function<void()>;
-    using Policy = std::function<void(Step, Step, Step)>;
-
-    Policy LKP = [](Step root, Step left, Step right) {
-        left(); root(); right();
+    enum class Part : std::size_t {
+        Root,
+        Left,
+        Right
     };
 
-    Policy KLP = [](Step root, Step left, Step right) {
-        root(); left(); right();
-    };
+    using Policy = std::array<Part, 3>;
 
-    Policy KPL = [](Step root, Step left, Step right) {
-        root(); right(); left();
-    };
-
-    Policy LPK = [](Step root, Step left, Step right) {
-        left(); right(); root();
-    };
-
-    Policy PLK = [](Step root, Step left, Step right) {
-        right(); left(); root();
-    };
-
-    Policy PKL = [](Step root, Step left, Step right) {
-        right(); root(); left();
-    };
+    inline Policy KLP{Part::Root, Part::Left, Part::Right};
+    inline Policy KPL{Part::Root, Part::Right, Part::Left};
+    inline Policy LKP{Part::Left, Part::Root, Part::Right};
+    inline Policy LPK{Part::Left, Part::Right, Part::Root};
+    inline Policy PLK{Part::Right, Part::Left, Part::Root};
+    inline Policy PKL{Part::Right, Part::Root, Part::Left};
 }
 
 template <typename T, typename Compare = std::less<T>>
-class AvlTree : public ICollection<T>{
+class AvlTree : public ICollection<T>, public avl::IEnumerable<T>{
     struct  Node{
         T value;
         std::unique_ptr<Node> left;
@@ -47,12 +66,138 @@ class AvlTree : public ICollection<T>{
     };
 
     using NodePtr = std::unique_ptr<Node>;
-
-    private:    
     
-
     NodePtr root_;
     Compare comp_;
+
+    struct EnumerationState {};
+
+    mutable std::shared_ptr<EnumerationState> enumerationState_;
+
+    std::shared_ptr<EnumerationState> enumerationState() const {
+        if (!enumerationState_)
+            enumerationState_ = std::make_shared<EnumerationState>();
+
+        return enumerationState_;
+    }
+
+    void invalidateEnumerators() noexcept {
+        enumerationState_.reset();
+    }
+
+
+    class TreeEnumerator final : public avl::IEnumerator<T> {
+        struct Task {
+            const Node* node = nullptr;
+            bool visit = false;
+        };
+
+        const Node* root_;
+        const Node* current_ = nullptr;
+        TraversalOrder::Policy rule_;
+
+        MutableSequenceArray<Task> actions_;
+        MutableSequenceArray<Task> stack_;
+
+        std::size_t top_ = 0;
+        std::weak_ptr<EnumerationState> state_;
+
+        void validateRule() const {
+            MutableSequenceArray<bool> used(3);
+
+            for (std::size_t i = 0; i < rule_.size(); ++i) {
+                const std::size_t index = indexOf(rule_[i]);
+
+                if (index >= used.GetLength() || used.Get(index))
+                    throw std::invalid_argument(
+                        "Неверное правило обхода"
+                    );
+
+                used.Set(index, true);
+            }
+        }
+
+        void checkValid() const {
+            if (state_.expired())
+                throw std::logic_error("Дерево изменено или уничтожено");
+        }
+
+        void push(Task task) {
+            if (top_ >= stack_.GetLength())
+                throw std::logic_error("Переполнен стек обхода");
+
+            stack_.Set(top_, task);
+            ++top_;
+        }
+
+        static std::size_t indexOf(TraversalOrder::Part part) {
+            return static_cast<std::size_t>(part);
+        }
+
+        void expand(const Node* node) {
+        actions_.Set(indexOf(TraversalOrder::Part::Root),{node, true});
+        actions_.Set(indexOf(TraversalOrder::Part::Left),{node->left.get(), false});
+        actions_.Set(indexOf(TraversalOrder::Part::Right),{node->right.get(), false});
+
+        for (std::size_t i = rule_.size(); i > 0; --i) {
+            Task task = actions_.Get(indexOf(rule_[i - 1]));
+
+            if (task.node)
+                push(task);
+        }
+    }
+
+    public:
+        TreeEnumerator(
+            const Node* root,
+            const TraversalOrder::Policy& rule,
+            std::weak_ptr<EnumerationState> state
+        )
+            : root_(root),
+              rule_(rule),
+              actions_(3),
+              stack_(root ? 2 * static_cast<std::size_t>(root->height) + 1 : 1),
+              state_(std::move(state)) {
+            validateRule();
+            reset();
+        }
+
+        bool moveNext() override {
+            checkValid();
+            current_ = nullptr;
+
+            while (top_ != 0) {
+                Task task = stack_.Get(--top_);
+
+                if (task.visit) {
+                    current_ = task.node;
+                    return true;
+                }
+
+                expand(task.node);
+            }
+
+            return false;
+        }
+
+        const T& current() const override {
+            checkValid();
+
+            if (!current_)
+                throw std::out_of_range("Текущего элемента нет");
+
+            return current_->value;
+        }
+
+        void reset() override {
+            checkValid();
+            top_ = 0;
+            current_ = nullptr;
+
+            if (root_)
+                push({root_, false});
+        }
+    };
 
     int getHeight(const Node* node){
         return node ? node->height : 0;
@@ -184,25 +329,25 @@ class AvlTree : public ICollection<T>{
         return 1 + countNodes(node->left.get()) + countNodes(node->right.get());
     }
 
-    template <typename Order, typename Visitor>
-    static void walk(const Node* node, Order& order, Visitor& visit) {
-        if (!node)
-            return;
+    // template <typename Order, typename Visitor>
+    // static void walk(const Node* node, Order& order, Visitor& visit) {
+    //     if (!node)
+    //         return;
 
-        auto root = [&] {
-            visit(node->value);
-        };
+    //     auto root = [&] {
+    //         visit(node->value);
+    //     };
 
-        auto left = [&] {
-            walk(node->left.get(), order, visit);
-        };
+    //     auto left = [&] {
+    //         walk(node->left.get(), order, visit);
+    //     };
 
-        auto right = [&] {
-            walk(node->right.get(), order, visit);
-        };
+    //     auto right = [&] {
+    //         walk(node->right.get(), order, visit);
+    //     };
 
-        order(root, left, right);
-    }
+    //     order(root, left, right);
+    // }
     
     static NodePtr cloneNode(const Node* node) {
         if (!node) return nullptr;
@@ -215,6 +360,12 @@ class AvlTree : public ICollection<T>{
     }
 
     void swap(AvlTree& other) {
+        if (this == &other)
+            return;
+
+        invalidateEnumerators();
+        other.invalidateEnumerators();
+
         using std::swap;
         swap(comp_, other.comp_);
         root_.swap(other.root_);
@@ -372,10 +523,12 @@ class AvlTree : public ICollection<T>{
     AvlTree(const Compare& comp) : comp_(comp) {}
 
     bool insert(const T& value) override {
+        invalidateEnumerators();
         return insertNode(root_, value);
     }
 
     bool erase(const T& value) override {
+        invalidateEnumerators();
         return eraseNode(root_, value);
     }
 
@@ -404,6 +557,7 @@ class AvlTree : public ICollection<T>{
     }
     
     void clear() override {
+        invalidateEnumerators();
         root_.reset();
     }
     
@@ -411,37 +565,36 @@ class AvlTree : public ICollection<T>{
         return root_ ? root_->height : 0;
     }
 
-    template <typename Order>
-    std::unique_ptr<Sequence<T>> traverse(Order order) {
-        const std::size_t finalSize = size();
-        auto result = std::make_unique<MutableSequenceArray<T>>(finalSize);
-        std::size_t index = 0;
+    std::unique_ptr<Sequence<T>> traverse(TraversalOrder::Policy order) const {
+        auto result = std::make_unique<MutableSequenceArray<T>>(size());
+        auto enumerator = getEnumerator(order);
 
-        auto visit = [&](const T& value) {
-            if (index >= finalSize)
-                throw std::invalid_argument("Обход посетил слишком много узлов");
+        for (std::size_t i = 0; i < result->GetLength(); ++i) {
+            if (!enumerator->moveNext())
+                throw std::logic_error("Обход пропустил узлы");
 
-            result->Set(index++, value);
-        };
+            result->Set(i, enumerator->current());
+        }
 
-        walk(root_.get(), order, visit);
-
-        if (index != finalSize)
-            throw std::invalid_argument("Обход пропустил узлы");
+        if (enumerator->moveNext())
+            throw std::logic_error("Обход посетил слишком много узлов");
 
         return result;
     }
 
-    template<class Order, class Func>
-    void traverse(Order order, Func&& action) const {
-        walk(root_.get(), order, action);
+    template<class Func>
+    void traverse(TraversalOrder::Policy order, Func&& action) const {
+        auto enumerator = getEnumerator(order);
+
+        while (enumerator->moveNext())
+            action(enumerator->current());
     }
 
     template<class Func>
     AvlTree map(Func action) const{
         AvlTree result(comp_);
 
-        traverse(TraversalOrder::LKP, [&](const T& value){
+        traverse(TraversalOrder::LKP, [&](const T& value) {
             result.insert(action(value));
         });
 
@@ -489,6 +642,15 @@ class AvlTree : public ICollection<T>{
             throw std::invalid_argument("Лишние символы после дерева");
 
         root_ = std::move(newRoot);
+    }
+
+    std::unique_ptr<avl::IEnumerator<T>> getEnumerator() const override {
+        return getEnumerator(TraversalOrder::LKP);
+    }
+
+    std::unique_ptr<avl::IEnumerator<T>>
+    getEnumerator(const TraversalOrder::Policy& rule) const {
+        return std::make_unique<TreeEnumerator>(root_.get(), rule, enumerationState());
     }
 
 
